@@ -49,10 +49,18 @@ if s:is_win
 
   " Use utf-8 for fzf.vim commands
   " Return array of shell commands for cmd.exe
+  let s:codepage = libcallnr('kernel32.dll', 'GetACP', 0)
+  function! s:enc_to_cp(str)
+    return iconv(a:str, &encoding, 'cp'.s:codepage)
+  endfunction
   function! s:wrap_cmds(cmds)
-    return map(['@echo off', 'for /f "tokens=4" %%a in (''chcp'') do set origchcp=%%a', 'chcp 65001 > nul'] +
-          \ (type(a:cmds) == type([]) ? a:cmds : [a:cmds]) +
-          \ ['chcp %origchcp% > nul'], 'v:val."\r"')
+    return map([
+      \ '@echo off',
+      \ 'setlocal enabledelayedexpansion']
+    \ + (has('gui_running') ? ['set TERM= > nul'] : [])
+    \ + (type(a:cmds) == type([]) ? a:cmds : [a:cmds])
+    \ + ['endlocal'],
+    \ '<SID>enc_to_cp(v:val."\r")')
   endfunction
 else
   let s:term_marker = ";#FZF"
@@ -63,6 +71,10 @@ else
 
   function! s:wrap_cmds(cmds)
     return a:cmds
+  endfunction
+
+  function! s:enc_to_cp(str)
+    return a:str
   endfunction
 endif
 
@@ -75,7 +87,7 @@ function! s:shellesc_cmd(arg)
 endfunction
 
 function! fzf#shellescape(arg, ...)
-  let shell = get(a:000, 0, &shell)
+  let shell = get(a:000, 0, s:is_win ? 'cmd.exe' : 'sh')
   if shell =~# 'cmd.exe$'
     return s:shellesc_cmd(a:arg)
   endif
@@ -239,7 +251,7 @@ function! s:common_sink(action, lines) abort
 endfunction
 
 function! s:get_color(attr, ...)
-  let gui = has('termguicolors') && &termguicolors
+  let gui = !s:is_win && !has('win32unix') && has('termguicolors') && &termguicolors
   let fam = gui ? 'gui' : 'cterm'
   let pat = gui ? '^#[a-f0-9]\+' : '^[0-9]\+$'
   for group in a:000
@@ -254,7 +266,7 @@ endfunction
 function! s:defaults()
   let rules = copy(get(g:, 'fzf_colors', {}))
   let colors = join(map(items(filter(map(rules, 'call("s:get_color", v:val)'), '!empty(v:val)')), 'join(v:val, ":")'), ',')
-  return empty(colors) ? '' : ('--color='.colors)
+  return empty(colors) ? '' : fzf#shellescape('--color='.colors)
 endfunction
 
 function! s:validate_layout(layout)
@@ -334,19 +346,21 @@ function! fzf#wrap(...)
 endfunction
 
 function! s:use_sh()
-  let [shell, shellslash] = [&shell, &shellslash]
+  let [shell, shellslash, shellcmdflag, shellxquote] = [&shell, &shellslash, &shellcmdflag, &shellxquote]
   if s:is_win
     set shell=cmd.exe
     set noshellslash
+    let &shellcmdflag = has('nvim') ? '/s /c' : '/c'
+    let &shellxquote = has('nvim') ? '"' : '('
   else
     set shell=sh
   endif
-  return [shell, shellslash]
+  return [shell, shellslash, shellcmdflag, shellxquote]
 endfunction
 
 function! fzf#run(...) abort
 try
-  let [shell, shellslash] = s:use_sh()
+  let [shell, shellslash, shellcmdflag, shellxquote] = s:use_sh()
 
   let dict   = exists('a:1') ? s:upgrade(a:1) : {}
   let temps  = { 'result': s:fzf_tempname() }
@@ -357,7 +371,7 @@ try
     throw v:exception
   endtry
 
-  if has('nvim') && !has_key(dict, 'dir')
+  if !has_key(dict, 'dir')
     let dict.dir = s:fzf_getcwd()
   endif
   if has('win32unix') && has_key(dict, 'dir')
@@ -377,7 +391,7 @@ try
       let prefix = '( '.source.' )|'
     elseif type == 3
       let temps.input = s:fzf_tempname()
-      call writefile(source, temps.input)
+      call writefile(map(source, '<SID>enc_to_cp(v:val)'), temps.input)
       let prefix = (s:is_win ? 'type ' : 'cat ').fzf#shellescape(temps.input).'|'
     else
       throw 'Invalid source type'
@@ -416,7 +430,7 @@ try
   call s:callback(dict, lines)
   return lines
 finally
-  let [&shell, &shellslash] = [shell, shellslash]
+  let [&shell, &shellslash, &shellcmdflag, &shellxquote] = [shell, shellslash, shellcmdflag, shellxquote]
 endtry
 endfunction
 
@@ -455,15 +469,18 @@ endfunction
 function! s:pushd(dict)
   if s:present(a:dict, 'dir')
     let cwd = s:fzf_getcwd()
-    if get(a:dict, 'prev_dir', '') ==# cwd
-      return 1
-    endif
-    let a:dict.prev_dir = cwd
+    let w:fzf_pushd = {
+    \   'command': haslocaldir() ? 'lcd' : (exists(':tcd') && haslocaldir(-1) ? 'tcd' : 'cd'),
+    \   'origin': cwd,
+    \   'bufname': bufname('')
+    \ }
     execute 'lcd' s:escape(a:dict.dir)
-    let a:dict.dir = s:fzf_getcwd()
-    return 1
+    let cwd = s:fzf_getcwd()
+    let w:fzf_pushd.dir = cwd
+    let a:dict.pushd = w:fzf_pushd
+    return cwd
   endif
-  return 0
+  return ''
 endfunction
 
 augroup fzf_popd
@@ -472,20 +489,38 @@ augroup fzf_popd
 augroup END
 
 function! s:dopopd()
-  if !exists('w:fzf_dir') || s:fzf_getcwd() != w:fzf_dir[1]
+  if !exists('w:fzf_pushd')
     return
   endif
-  execute 'lcd' s:escape(w:fzf_dir[0])
-  unlet w:fzf_dir
+
+  " FIXME: We temporarily change the working directory to 'dir' entry
+  " of options dictionary (set to the current working directory if not given)
+  " before running fzf.
+  "
+  " e.g. call fzf#run({'dir': '/tmp', 'source': 'ls', 'sink': 'e'})
+  "
+  " After processing the sink function, we have to restore the current working
+  " directory. But doing so may not be desirable if the function changed the
+  " working directory on purpose.
+  "
+  " So how can we tell if we should do it or not? A simple heuristic we use
+  " here is that we change directory only if the current working directory
+  " matches 'dir' entry. However, it is possible that the sink function did
+  " change the directory to 'dir'. In that case, the user will have an
+  " unexpected result.
+  if s:fzf_getcwd() ==# w:fzf_pushd.dir && (!&autochdir || w:fzf_pushd.bufname ==# bufname(''))
+    execute w:fzf_pushd.command s:escape(w:fzf_pushd.origin)
+  endif
+  unlet w:fzf_pushd
 endfunction
 
 function! s:xterm_launcher()
-  let fmt = 'xterm -T "[fzf]" -bg "\%s" -fg "\%s" -geometry %dx%d+%d+%d -e bash -ic %%s'
+  let fmt = 'xterm -T "[fzf]" -bg "%s" -fg "%s" -geometry %dx%d+%d+%d -e bash -ic %%s'
   if has('gui_macvim')
     let fmt .= '&& osascript -e "tell application \"MacVim\" to activate"'
   endif
   return printf(fmt,
-    \ synIDattr(hlID("Normal"), "bg"), synIDattr(hlID("Normal"), "fg"),
+    \ escape(synIDattr(hlID("Normal"), "bg"), '#'), escape(synIDattr(hlID("Normal"), "fg"), '#'),
     \ &columns, &lines/2, getwinposx(), getwinposy())
 endfunction
 unlet! s:launcher
@@ -497,6 +532,10 @@ endif
 
 function! s:exit_handler(code, command, ...)
   if a:code == 130
+    return 0
+  elseif has('nvim') && a:code == 129
+    " When deleting the terminal buffer while fzf is still running,
+    " Nvim sends SIGHUP.
     return 0
   elseif a:code > 1
     call s:error('Error running ' . a:command)
@@ -534,9 +573,7 @@ function! s:execute(dict, command, use_height, temps) abort
       let fzf.dict = a:dict
       let fzf.temps = a:temps
       function! fzf.on_exit(job_id, exit_status, event) dict
-        if s:present(self.dict, 'dir')
-          execute 'lcd' s:escape(self.dict.dir)
-        endif
+        call s:pushd(self.dict)
         let lines = s:collect(self.temps)
         call s:callback(self.dict, lines)
       endfunction
@@ -563,9 +600,10 @@ endfunction
 
 function! s:execute_tmux(dict, command, temps) abort
   let command = a:command
-  if s:pushd(a:dict)
+  let cwd = s:pushd(a:dict)
+  if len(cwd)
     " -c '#{pane_current_path}' is only available on tmux 1.9 or above
-    let command = join(['cd', fzf#shellescape(a:dict.dir), '&&', command])
+    let command = join(['cd', fzf#shellescape(cwd), '&&', command])
   endif
 
   call system(command)
@@ -587,8 +625,9 @@ function! s:calc_size(max, val, dict)
     let srcsz = len(a:dict.source)
   endif
 
-  let opts = s:evaluate_opts(get(a:dict, 'options', '')).$FZF_DEFAULT_OPTS
+  let opts = $FZF_DEFAULT_OPTS.' '.s:evaluate_opts(get(a:dict, 'options', ''))
   let margin = stridx(opts, '--inline-info') > stridx(opts, '--no-inline-info') ? 1 : 2
+  let margin += stridx(opts, '--border') > stridx(opts, '--no-border') ? 2 : 0
   let margin += stridx(opts, '--header') > stridx(opts, '--no-header')
   return srcsz >= 0 ? min([srcsz + margin, size]) : size
 endfunction
@@ -686,9 +725,7 @@ function! s:execute_term(dict, command, temps) abort
   endfunction
 
   try
-    if s:present(a:dict, 'dir')
-      execute 'lcd' s:escape(a:dict.dir)
-    endif
+    call s:pushd(a:dict)
     if s:is_win
       let fzf.temps.batchfile = s:fzf_tempname().'.bat'
       call writefile(s:wrap_cmds(a:command), fzf.temps.batchfile)
@@ -706,9 +743,7 @@ function! s:execute_term(dict, command, temps) abort
       endif
     endif
   finally
-    if s:present(a:dict, 'dir')
-      lcd -
-    endif
+    call s:dopopd()
   endtry
   setlocal nospell bufhidden=wipe nobuflisted nonumber
   setf fzf
@@ -727,21 +762,9 @@ function! s:collect(temps) abort
 endfunction
 
 function! s:callback(dict, lines) abort
-  " Since anything can be done in the sink function, there is no telling that
-  " the change of the working directory was made by &autochdir setting.
-  "
-  " We use the following heuristic to determine whether to restore CWD:
-  " - Always restore the current directory when &autochdir is disabled.
-  "   FIXME This makes it impossible to change directory from inside the sink
-  "   function when &autochdir is not used.
-  " - In case of an error or an interrupt, a:lines will be empty.
-  "   And it will be an array of a single empty string when fzf was finished
-  "   without a match. In these cases, we presume that the change of the
-  "   directory is not expected and should be undone.
-  let popd = has_key(a:dict, 'prev_dir') &&
-        \ (!&autochdir || (empty(a:lines) || len(a:lines) == 1 && empty(a:lines[0])))
+  let popd = has_key(a:dict, 'pushd')
   if popd
-    let w:fzf_dir = [a:dict.prev_dir, a:dict.dir]
+    let w:fzf_pushd = a:dict.pushd
   endif
 
   try
@@ -765,7 +788,7 @@ function! s:callback(dict, lines) abort
 
   " We may have opened a new window or tab
   if popd
-    let w:fzf_dir = [a:dict.prev_dir, a:dict.dir]
+    let w:fzf_pushd = a:dict.pushd
     call s:dopopd()
   endif
 endfunction

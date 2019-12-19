@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/signal"
 	"regexp"
@@ -22,9 +23,11 @@ import (
 // import "github.com/pkg/profile"
 
 var placeholder *regexp.Regexp
+var activeTempFiles []string
 
 func init() {
-	placeholder = regexp.MustCompile("\\\\?(?:{[+s]*[0-9,-.]*}|{q})")
+	placeholder = regexp.MustCompile(`\\?(?:{[+sf]*[0-9,-.]*}|{q}|{\+?f?nf?})`)
+	activeTempFiles = []string{}
 }
 
 type jumpMode int
@@ -40,6 +43,7 @@ type previewer struct {
 	lines   int
 	offset  int
 	enabled bool
+	more    bool
 }
 
 type itemLine struct {
@@ -56,7 +60,7 @@ var emptyLine = itemLine{}
 // Terminal represents terminal input/output
 type Terminal struct {
 	initDelay  time.Duration
-	inlineInfo bool
+	infoStyle  infoStyle
 	prompt     string
 	promptLen  int
 	queryLen   [2]int
@@ -72,7 +76,7 @@ type Terminal struct {
 	xoffset    int
 	yanked     []rune
 	input      []rune
-	multi      bool
+	multi      int
 	sort       bool
 	toggleSort bool
 	delimiter  Delimiter
@@ -88,6 +92,7 @@ type Terminal struct {
 	tabstop    int
 	margin     [4]sizeSpec
 	strong     tui.Attr
+	unicode    bool
 	bordered   bool
 	cleanExit  bool
 	border     tui.Window
@@ -97,10 +102,11 @@ type Terminal struct {
 	count      int
 	progress   int
 	reading    bool
-	success    bool
+	failed     *string
 	jumping    jumpMode
 	jumpLabels string
 	printer    func(string)
+	printsep   string
 	merger     *Merger
 	selected   map[int32]selectedItem
 	version    int64
@@ -114,6 +120,7 @@ type Terminal struct {
 	prevLines  []itemLine
 	suppress   bool
 	startChan  chan bool
+	killChan   chan int
 	slab       *util.Slab
 	theme      *tui.ColorTheme
 	tui        tui.Renderer
@@ -178,6 +185,8 @@ const (
 	actBackwardWord
 	actCancel
 	actClearScreen
+	actClearQuery
+	actClearSelection
 	actDeleteChar
 	actDeleteCharEOF
 	actEndOfLine
@@ -221,12 +230,20 @@ const (
 	actExecuteMulti // Deprecated
 	actSigStop
 	actTop
+	actReload
 )
 
 type placeholderFlags struct {
 	plus          bool
 	preserveSpace bool
+	number        bool
 	query         bool
+	file          bool
+}
+
+type searchRequest struct {
+	sort    bool
+	command *string
 }
 
 func toActions(types ...actionType) []action {
@@ -346,7 +363,7 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 			if previewBox != nil && (opts.Preview.position == posUp || opts.Preview.position == posDown) {
 				effectiveMinHeight *= 2
 			}
-			if opts.InlineInfo {
+			if opts.InfoStyle != infoDefault {
 				effectiveMinHeight -= 1
 			}
 			if opts.Bordered {
@@ -365,7 +382,7 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 	}
 	t := Terminal{
 		initDelay:  delay,
-		inlineInfo: opts.InlineInfo,
+		infoStyle:  opts.InfoStyle,
 		queryLen:   [2]int{0, 0},
 		layout:     opts.Layout,
 		fullscreen: fullscreen,
@@ -389,6 +406,7 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		printQuery: opts.PrintQuery,
 		history:    opts.History,
 		margin:     opts.Margin,
+		unicode:    opts.Unicode,
 		bordered:   opts.Bordered,
 		cleanExit:  opts.ClearOnExit,
 		strong:     strongAttr,
@@ -398,15 +416,16 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		ansi:       opts.Ansi,
 		tabstop:    opts.Tabstop,
 		reading:    true,
-		success:    true,
+		failed:     nil,
 		jumping:    jumpDisabled,
 		jumpLabels: opts.JumpLabels,
 		printer:    opts.Printer,
+		printsep:   opts.PrintSep,
 		merger:     EmptyMerger,
 		selected:   make(map[int32]selectedItem),
 		reqBox:     util.NewEventBox(),
 		preview:    opts.Preview,
-		previewer:  previewer{"", 0, 0, previewBox != nil && !opts.Preview.hidden},
+		previewer:  previewer{"", 0, 0, previewBox != nil && !opts.Preview.hidden, false},
 		previewBox: previewBox,
 		eventBox:   eventBox,
 		mutex:      sync.Mutex{},
@@ -414,10 +433,15 @@ func NewTerminal(opts *Options, eventBox *util.EventBox) *Terminal {
 		slab:       util.MakeSlab(slab16Size, slab32Size),
 		theme:      opts.Theme,
 		startChan:  make(chan bool, 1),
+		killChan:   make(chan int),
 		tui:        renderer,
 		initFunc:   func() { renderer.Init() }}
 	t.prompt, t.promptLen = t.processTabs([]rune(opts.Prompt), 0)
 	return &t
+}
+
+func (t *Terminal) noInfoLine() bool {
+	return t.infoStyle != infoDefault
 }
 
 // Input returns current query string
@@ -428,11 +452,11 @@ func (t *Terminal) Input() []rune {
 }
 
 // UpdateCount updates the count information
-func (t *Terminal) UpdateCount(cnt int, final bool, success bool) {
+func (t *Terminal) UpdateCount(cnt int, final bool, failedCommand *string) {
 	t.mutex.Lock()
 	t.count = cnt
 	t.reading = !final
-	t.success = success
+	t.failed = failedCommand
 	t.mutex.Unlock()
 	t.reqBox.Set(reqInfo, nil)
 	if final {
@@ -471,10 +495,13 @@ func (t *Terminal) UpdateProgress(progress float32) {
 }
 
 // UpdateList updates Merger to display the list
-func (t *Terminal) UpdateList(merger *Merger) {
+func (t *Terminal) UpdateList(merger *Merger, reset bool) {
 	t.mutex.Lock()
 	t.progress = 100
 	t.merger = merger
+	if reset {
+		t.selected = make(map[int32]selectedItem)
+	}
 	t.mutex.Unlock()
 	t.reqBox.Set(reqInfo, nil)
 	t.reqBox.Set(reqList, nil)
@@ -597,11 +624,17 @@ func (t *Terminal) resizeWindows() {
 			marginInt[0]-1,
 			marginInt[3],
 			width,
-			height+2, tui.BorderHorizontal)
+			height+2,
+			false, tui.MakeBorderStyle(tui.BorderHorizontal, t.unicode))
 	}
+	noBorder := tui.MakeBorderStyle(tui.BorderNone, t.unicode)
 	if previewVisible {
 		createPreviewWindow := func(y int, x int, w int, h int) {
-			t.pborder = t.tui.NewWindow(y, x, w, h, tui.BorderAround)
+			previewBorder := tui.MakeBorderStyle(tui.BorderAround, t.unicode)
+			if !t.preview.border {
+				previewBorder = tui.MakeTransparentBorder()
+			}
+			t.pborder = t.tui.NewWindow(y, x, w, h, true, previewBorder)
 			pwidth := w - 4
 			// ncurses auto-wraps the line when the cursor reaches the right-end of
 			// the window. To prevent unintended line-wraps, we use the width one
@@ -609,29 +642,28 @@ func (t *Terminal) resizeWindows() {
 			if !t.preview.wrap && t.tui.DoesAutoWrap() {
 				pwidth += 1
 			}
-			t.pwindow = t.tui.NewWindow(y+1, x+2, pwidth, h-2, tui.BorderNone)
-			os.Setenv("FZF_PREVIEW_HEIGHT", strconv.Itoa(h-2))
+			t.pwindow = t.tui.NewWindow(y+1, x+2, pwidth, h-2, true, noBorder)
 		}
 		switch t.preview.position {
 		case posUp:
 			pheight := calculateSize(height, t.preview.size, minHeight, 3)
 			t.window = t.tui.NewWindow(
-				marginInt[0]+pheight, marginInt[3], width, height-pheight, tui.BorderNone)
+				marginInt[0]+pheight, marginInt[3], width, height-pheight, false, noBorder)
 			createPreviewWindow(marginInt[0], marginInt[3], width, pheight)
 		case posDown:
 			pheight := calculateSize(height, t.preview.size, minHeight, 3)
 			t.window = t.tui.NewWindow(
-				marginInt[0], marginInt[3], width, height-pheight, tui.BorderNone)
+				marginInt[0], marginInt[3], width, height-pheight, false, noBorder)
 			createPreviewWindow(marginInt[0]+height-pheight, marginInt[3], width, pheight)
 		case posLeft:
 			pwidth := calculateSize(width, t.preview.size, minWidth, 5)
 			t.window = t.tui.NewWindow(
-				marginInt[0], marginInt[3]+pwidth, width-pwidth, height, tui.BorderNone)
+				marginInt[0], marginInt[3]+pwidth, width-pwidth, height, false, noBorder)
 			createPreviewWindow(marginInt[0], marginInt[3], pwidth, height)
 		case posRight:
 			pwidth := calculateSize(width, t.preview.size, minWidth, 5)
 			t.window = t.tui.NewWindow(
-				marginInt[0], marginInt[3], width-pwidth, height, tui.BorderNone)
+				marginInt[0], marginInt[3], width-pwidth, height, false, noBorder)
 			createPreviewWindow(marginInt[0], marginInt[3]+width-pwidth, pwidth, height)
 		}
 	} else {
@@ -639,7 +671,7 @@ func (t *Terminal) resizeWindows() {
 			marginInt[0],
 			marginInt[3],
 			width,
-			height, tui.BorderNone)
+			height, false, noBorder)
 	}
 	for i := 0; i < t.window.Height(); i++ {
 		t.window.MoveAndClear(i, 0)
@@ -654,7 +686,7 @@ func (t *Terminal) move(y int, x int, clear bool) {
 		y = h - y - 1
 	case layoutReverseList:
 		n := 2 + len(t.header)
-		if t.inlineInfo {
+		if t.noInfoLine() {
 			n--
 		}
 		if y < n {
@@ -707,7 +739,17 @@ func (t *Terminal) printPrompt() {
 
 func (t *Terminal) printInfo() {
 	pos := 0
-	if t.inlineInfo {
+	switch t.infoStyle {
+	case infoDefault:
+		t.move(1, 0, true)
+		if t.reading {
+			duration := int64(spinnerDuration)
+			idx := (time.Now().UnixNano() % (duration * int64(len(_spinner)))) / duration
+			t.window.CPrint(tui.ColSpinner, t.strong, _spinner[idx])
+		}
+		t.move(1, 2, false)
+		pos = 2
+	case infoInline:
 		pos = t.promptLen + t.queryLen[0] + t.queryLen[1] + 1
 		if pos+len(" < ") > t.window.Width() {
 			return
@@ -719,18 +761,13 @@ func (t *Terminal) printInfo() {
 			t.window.CPrint(tui.ColPrompt, t.strong, " < ")
 		}
 		pos += len(" < ")
-	} else {
-		t.move(1, 0, true)
-		if t.reading {
-			duration := int64(spinnerDuration)
-			idx := (time.Now().UnixNano() % (duration * int64(len(_spinner)))) / duration
-			t.window.CPrint(tui.ColSpinner, t.strong, _spinner[idx])
-		}
-		t.move(1, 2, false)
-		pos = 2
+	case infoHidden:
+		return
 	}
 
-	output := fmt.Sprintf("%d/%d", t.merger.Length(), t.count)
+	found := t.merger.Length()
+	total := util.Max(found, t.count)
+	output := fmt.Sprintf("%d/%d", found, total)
 	if t.toggleSort {
 		if t.sort {
 			output += " +S"
@@ -738,22 +775,25 @@ func (t *Terminal) printInfo() {
 			output += " -S"
 		}
 	}
-	if t.multi && len(t.selected) > 0 {
-		output += fmt.Sprintf(" (%d)", len(t.selected))
+	if len(t.selected) > 0 {
+		if t.multi == maxMulti {
+			output += fmt.Sprintf(" (%d)", len(t.selected))
+		} else {
+			output += fmt.Sprintf(" (%d/%d)", len(t.selected), t.multi)
+		}
 	}
 	if t.progress > 0 && t.progress < 100 {
 		output += fmt.Sprintf(" (%d%%)", t.progress)
 	}
-	if !t.success && t.count == 0 {
-		if len(os.Getenv("FZF_DEFAULT_COMMAND")) > 0 {
-			output = "[$FZF_DEFAULT_COMMAND failed]"
-		} else {
-			output = "[default command failed - $FZF_DEFAULT_COMMAND required]"
-		}
+	if t.failed != nil && t.count == 0 {
+		output = fmt.Sprintf("[Command failed: %s]", *t.failed)
 	}
-	if pos+len(output) <= t.window.Width() {
-		t.window.CPrint(tui.ColInfo, 0, output)
+	maxWidth := t.window.Width() - pos
+	if len(output) > maxWidth {
+		outputRunes, _ := t.trimRight([]rune(output), maxWidth-2)
+		output = string(outputRunes) + ".."
 	}
+	t.window.CPrint(tui.ColInfo, 0, output)
 }
 
 func (t *Terminal) printHeader() {
@@ -764,7 +804,7 @@ func (t *Terminal) printHeader() {
 	var state *ansiState
 	for idx, lineStr := range t.header {
 		line := idx + 2
-		if t.inlineInfo {
+		if t.noInfoLine() {
 			line--
 		}
 		if line >= max {
@@ -793,7 +833,7 @@ func (t *Terminal) printList() {
 			i = maxy - 1 - j
 		}
 		line := i + 2 + len(t.header)
-		if t.inlineInfo {
+		if t.noInfoLine() {
 			line--
 		}
 		if i < count {
@@ -832,15 +872,16 @@ func (t *Terminal) printItem(result Result, line int, i int, current bool) {
 	}
 
 	t.move(line, 0, false)
-	t.window.CPrint(tui.ColCursor, t.strong, label)
 	if current {
+		t.window.CPrint(tui.ColCurrentCursor, t.strong, label)
 		if selected {
-			t.window.CPrint(tui.ColSelected, t.strong, ">")
+			t.window.CPrint(tui.ColCurrentSelected, t.strong, ">")
 		} else {
-			t.window.CPrint(tui.ColCurrent, t.strong, " ")
+			t.window.CPrint(tui.ColCurrentSelected, t.strong, " ")
 		}
 		newLine.width = t.printHighlighted(result, t.strong, tui.ColCurrent, tui.ColCurrentMatch, true, true)
 	} else {
+		t.window.CPrint(tui.ColCursor, t.strong, label)
 		if selected {
 			t.window.CPrint(tui.ColSelected, t.strong, ">")
 		} else {
@@ -995,19 +1036,6 @@ func (t *Terminal) printHighlighted(result Result, attr tui.Attr, col1 tui.Color
 	return displayWidth
 }
 
-func numLinesMax(str string, max int) int {
-	lines := 0
-	for lines < max {
-		idx := strings.Index(str, "\n")
-		if idx < 0 {
-			break
-		}
-		str = str[idx+1:]
-		lines++
-	}
-	return lines
-}
-
 func (t *Terminal) printPreview() {
 	if !t.hasPreviewWindow() {
 		return
@@ -1021,36 +1049,37 @@ func (t *Terminal) printPreview() {
 	reader := bufio.NewReader(strings.NewReader(t.previewer.text))
 	lineNo := -t.previewer.offset
 	height := t.pwindow.Height()
+	t.previewer.more = t.previewer.offset > 0
 	var ansi *ansiState
-	for {
+	for ; ; lineNo++ {
 		line, err := reader.ReadString('\n')
 		eof := err == io.EOF
 		if !eof {
 			line = line[:len(line)-1]
 		}
-		lineNo++
-		if lineNo > height ||
-			t.pwindow.Y() == height-1 && t.pwindow.X() > 0 {
+		if lineNo >= height || t.pwindow.Y() == height-1 && t.pwindow.X() > 0 {
 			break
-		} else if lineNo > 0 {
+		} else if lineNo >= 0 {
 			var fillRet tui.FillReturn
+			prefixWidth := 0
 			_, _, ansi = extractColor(line, ansi, func(str string, ansi *ansiState) bool {
 				trimmed := []rune(str)
 				if !t.preview.wrap {
 					trimmed, _ = t.trimRight(trimmed, maxWidth-t.pwindow.X())
 				}
-				str, _ = t.processTabs(trimmed, 0)
+				str, width := t.processTabs(trimmed, prefixWidth)
+				prefixWidth += width
 				if t.theme != nil && ansi != nil && ansi.colored() {
 					fillRet = t.pwindow.CFill(ansi.fg, ansi.bg, ansi.attr, str)
 				} else {
-					fillRet = t.pwindow.CFill(tui.ColNormal.Fg(), tui.ColNormal.Bg(), tui.AttrRegular, str)
+					fillRet = t.pwindow.CFill(tui.ColPreview.Fg(), tui.ColPreview.Bg(), tui.AttrRegular, str)
 				}
 				return fillRet == tui.FillContinue
 			})
-			switch fillRet {
-			case tui.FillNextLine:
+			t.previewer.more = t.previewer.more || t.pwindow.Y() == height-1 && t.pwindow.X() == t.pwindow.Width()
+			if fillRet == tui.FillNextLine {
 				continue
-			case tui.FillSuspend:
+			} else if fillRet == tui.FillSuspend {
 				break
 			}
 			t.pwindow.Fill("\n")
@@ -1061,6 +1090,7 @@ func (t *Terminal) printPreview() {
 	}
 	t.pwindow.FinishFill()
 	if t.previewer.lines > height {
+		t.previewer.more = true
 		offset := fmt.Sprintf("%d/%d", t.previewer.offset+1, t.previewer.lines)
 		pos := t.pwindow.Width() - len(offset)
 		if t.tui.DoesAutoWrap() {
@@ -1096,6 +1126,7 @@ func (t *Terminal) printAll() {
 }
 
 func (t *Terminal) refresh() {
+	t.placeCursor()
 	if !t.suppress {
 		windows := make([]tui.Window, 0, 4)
 		if t.bordered {
@@ -1194,6 +1225,12 @@ func parsePlaceholder(match string) (bool, string, placeholderFlags) {
 		case 's':
 			flags.preserveSpace = true
 			skipChars++
+		case 'n':
+			flags.number = true
+			skipChars++
+		case 'f':
+			flags.file = true
+			skipChars++
 		case 'q':
 			flags.query = true
 		default:
@@ -1206,7 +1243,7 @@ func parsePlaceholder(match string) (bool, string, placeholderFlags) {
 	return false, matchWithoutFlags, flags
 }
 
-func hasPreviewFlags(template string) (plus bool, query bool) {
+func hasPreviewFlags(template string) (slot bool, plus bool, query bool) {
 	for _, match := range placeholder.FindAllString(template, -1) {
 		_, _, flags := parsePlaceholder(match)
 		if flags.plus {
@@ -1215,11 +1252,32 @@ func hasPreviewFlags(template string) (plus bool, query bool) {
 		if flags.query {
 			query = true
 		}
+		slot = true
 	}
 	return
 }
 
-func replacePlaceholder(template string, stripAnsi bool, delimiter Delimiter, forcePlus bool, query string, allItems []*Item) string {
+func writeTemporaryFile(data []string, printSep string) string {
+	f, err := ioutil.TempFile("", "fzf-preview-*")
+	if err != nil {
+		errorExit("Unable to create temporary file")
+	}
+	defer f.Close()
+
+	f.WriteString(strings.Join(data, printSep))
+	f.WriteString(printSep)
+	activeTempFiles = append(activeTempFiles, f.Name())
+	return f.Name()
+}
+
+func cleanTemporaryFiles() {
+	for _, filename := range activeTempFiles {
+		os.Remove(filename)
+	}
+	activeTempFiles = []string{}
+}
+
+func replacePlaceholder(template string, stripAnsi bool, delimiter Delimiter, printsep string, forcePlus bool, query string, allItems []*Item) string {
 	current := allItems[:1]
 	selected := allItems[1:]
 	if current[0] == nil {
@@ -1249,7 +1307,21 @@ func replacePlaceholder(template string, stripAnsi bool, delimiter Delimiter, fo
 
 		if match == "{}" {
 			for idx, item := range items {
-				replacements[idx] = quoteEntry(item.AsString(stripAnsi))
+				if flags.number {
+					n := int(item.text.Index)
+					if n < 0 {
+						replacements[idx] = ""
+					} else {
+						replacements[idx] = strconv.Itoa(n)
+					}
+				} else if flags.file {
+					replacements[idx] = item.AsString(stripAnsi)
+				} else {
+					replacements[idx] = quoteEntry(item.AsString(stripAnsi))
+				}
+			}
+			if flags.file {
+				return writeTemporaryFile(replacements, printsep)
 			}
 			return strings.Join(replacements, " ")
 		}
@@ -1268,7 +1340,7 @@ func replacePlaceholder(template string, stripAnsi bool, delimiter Delimiter, fo
 		for idx, item := range items {
 			tokens := Tokenize(item.AsString(stripAnsi), delimiter)
 			trans := Transform(tokens, ranges)
-			str := string(joinTokens(trans))
+			str := joinTokens(trans)
 			if delimiter.str != nil {
 				str = strings.TrimSuffix(str, *delimiter.str)
 			} else if delimiter.regex != nil {
@@ -1280,7 +1352,13 @@ func replacePlaceholder(template string, stripAnsi bool, delimiter Delimiter, fo
 			if !flags.preserveSpace {
 				str = strings.TrimSpace(str)
 			}
-			replacements[idx] = quoteEntry(str)
+			if !flags.file {
+				str = quoteEntry(str)
+			}
+			replacements[idx] = str
+		}
+		if flags.file {
+			return writeTemporaryFile(replacements, printsep)
 		}
 		return strings.Join(replacements, " ")
 	})
@@ -1297,8 +1375,8 @@ func (t *Terminal) executeCommand(template string, forcePlus bool, background bo
 	if !valid {
 		return
 	}
-	command := replacePlaceholder(template, t.ansi, t.delimiter, forcePlus, string(t.input), list)
-	cmd := util.ExecCommand(command)
+	command := replacePlaceholder(template, t.ansi, t.delimiter, t.printsep, forcePlus, string(t.input), list)
+	cmd := util.ExecCommand(command, false)
 	if !background {
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
@@ -1309,8 +1387,11 @@ func (t *Terminal) executeCommand(template string, forcePlus bool, background bo
 		t.redraw()
 		t.refresh()
 	} else {
+		t.tui.Pause(false)
 		cmd.Run()
+		t.tui.Resume(false)
 	}
+	cleanTemporaryFiles()
 }
 
 func (t *Terminal) hasPreviewer() bool {
@@ -1327,7 +1408,7 @@ func (t *Terminal) hasPreviewWindow() bool {
 
 func (t *Terminal) currentItem() *Item {
 	cnt := t.merger.Length()
-	if cnt > 0 && cnt > t.cy {
+	if t.cy >= 0 && cnt > 0 && cnt > t.cy {
 		return t.merger.Get(t.cy).item
 	}
 	return nil
@@ -1335,7 +1416,7 @@ func (t *Terminal) currentItem() *Item {
 
 func (t *Terminal) buildPlusList(template string, forcePlus bool) (bool, []*Item) {
 	current := t.currentItem()
-	plus, query := hasPreviewFlags(template)
+	_, plus, query := hasPreviewFlags(template)
 	if !(query && len(t.input) > 0 || (forcePlus || plus) && len(t.selected) > 0) {
 		return current != nil, []*Item{current, current}
 	}
@@ -1345,7 +1426,7 @@ func (t *Terminal) buildPlusList(template string, forcePlus bool) (bool, []*Item
 	//   2. or it contains {+} and we have more than one item already selected.
 	// To do so, we pass an empty Item instead of nil to trigger an update.
 	if current == nil {
-		current = &Item{}
+		current = &minItem
 	}
 
 	var sels []*Item
@@ -1361,9 +1442,18 @@ func (t *Terminal) buildPlusList(template string, forcePlus bool) (bool, []*Item
 	return true, sels
 }
 
-func (t *Terminal) selectItem(item *Item) {
+func (t *Terminal) selectItem(item *Item) bool {
+	if len(t.selected) >= t.multi {
+		return false
+	}
+	if _, found := t.selected[item.Index()]; found {
+		return true
+	}
+
 	t.selected[item.Index()] = selectedItem{time.Now(), item}
 	t.version++
+
+	return true
 }
 
 func (t *Terminal) deselectItem(item *Item) {
@@ -1371,12 +1461,26 @@ func (t *Terminal) deselectItem(item *Item) {
 	t.version++
 }
 
-func (t *Terminal) toggleItem(item *Item) {
+func (t *Terminal) toggleItem(item *Item) bool {
 	if _, found := t.selected[item.Index()]; !found {
-		t.selectItem(item)
-	} else {
-		t.deselectItem(item)
+		return t.selectItem(item)
 	}
+	t.deselectItem(item)
+	return true
+}
+
+func (t *Terminal) killPreview(code int) {
+	select {
+	case t.killChan <- code:
+	default:
+		if code != exitCancel {
+			os.Exit(code)
+		}
+	}
+}
+
+func (t *Terminal) cancelPreview() {
+	t.killPreview(exitCancel)
 }
 
 // Loop is called to start Terminal I/O
@@ -1385,7 +1489,7 @@ func (t *Terminal) Loop() {
 	<-t.startChan
 	{ // Late initialization
 		intChan := make(chan os.Signal, 1)
-		signal.Notify(intChan, os.Interrupt, os.Kill, syscall.SIGTERM)
+		signal.Notify(intChan, os.Interrupt, syscall.SIGTERM)
 		go func() {
 			<-intChan
 			t.reqBox.Set(reqQuit, nil)
@@ -1415,7 +1519,6 @@ func (t *Terminal) Loop() {
 		t.printPrompt()
 		t.printInfo()
 		t.printHeader()
-		t.placeCursor()
 		t.refresh()
 		t.mutex.Unlock()
 		go func() {
@@ -1430,11 +1533,10 @@ func (t *Terminal) Loop() {
 				t.mutex.Lock()
 				reading := t.reading
 				t.mutex.Unlock()
-				if !reading {
-					break
-				}
 				time.Sleep(spinnerDuration)
-				t.reqBox.Set(reqInfo, nil)
+				if reading {
+					t.reqBox.Set(reqInfo, nil)
+				}
 			}
 		}()
 	}
@@ -1455,16 +1557,49 @@ func (t *Terminal) Loop() {
 				// We don't display preview window if no match
 				if request[0] != nil {
 					command := replacePlaceholder(t.preview.command,
-						t.ansi, t.delimiter, false, string(t.input), request)
-					cmd := util.ExecCommand(command)
+						t.ansi, t.delimiter, t.printsep, false, string(t.Input()), request)
+					cmd := util.ExecCommand(command, true)
 					if t.pwindow != nil {
 						env := os.Environ()
-						env = append(env, fmt.Sprintf("LINES=%d", t.pwindow.Height()))
-						env = append(env, fmt.Sprintf("COLUMNS=%d", t.pwindow.Width()))
+						lines := fmt.Sprintf("LINES=%d", t.pwindow.Height())
+						columns := fmt.Sprintf("COLUMNS=%d", t.pwindow.Width())
+						env = append(env, lines)
+						env = append(env, "FZF_PREVIEW_"+lines)
+						env = append(env, columns)
+						env = append(env, "FZF_PREVIEW_"+columns)
 						cmd.Env = env
 					}
-					out, _ := cmd.CombinedOutput()
-					t.reqBox.Set(reqPreviewDisplay, string(out))
+					var out bytes.Buffer
+					cmd.Stdout = &out
+					cmd.Stderr = &out
+					cmd.Start()
+					finishChan := make(chan bool, 1)
+					updateChan := make(chan bool)
+					go func() {
+						select {
+						case code := <-t.killChan:
+							if code != exitCancel {
+								util.KillCommand(cmd)
+								os.Exit(code)
+							} else {
+								select {
+								case <-time.After(previewCancelWait):
+									util.KillCommand(cmd)
+									updateChan <- true
+								case <-finishChan:
+									updateChan <- false
+								}
+							}
+						case <-finishChan:
+							updateChan <- false
+						}
+					}()
+					cmd.Wait()
+					finishChan <- true
+					if out.Len() > 0 || !<-updateChan {
+						t.reqBox.Set(reqPreviewDisplay, out.String())
+					}
+					cleanTemporaryFiles()
 				} else {
 					t.reqBox.Set(reqPreviewDisplay, "")
 				}
@@ -1473,21 +1608,18 @@ func (t *Terminal) Loop() {
 	}
 
 	exit := func(getCode func() int) {
-		if !t.cleanExit && t.fullscreen && t.inlineInfo {
-			t.placeCursor()
-		}
 		t.tui.Close()
 		code := getCode()
 		if code <= exitNoMatch && t.history != nil {
 			t.history.append(string(t.input))
 		}
 		// prof.Stop()
-		os.Exit(code)
+		t.killPreview(code)
 	}
 
 	go func() {
-		var focused *Item
-		var version int64
+		var focusedIndex int32 = minItem.Index()
+		var version int64 = -1
 		for {
 			t.reqBox.Wait(func(events *util.Events) {
 				defer events.Clear()
@@ -1496,19 +1628,24 @@ func (t *Terminal) Loop() {
 					switch req {
 					case reqPrompt:
 						t.printPrompt()
-						if t.inlineInfo {
+						if t.noInfoLine() {
 							t.printInfo()
 						}
 					case reqInfo:
 						t.printInfo()
 					case reqList:
 						t.printList()
-						currentFocus := t.currentItem()
-						if currentFocus != focused || version != t.version {
+						var currentIndex int32 = minItem.Index()
+						currentItem := t.currentItem()
+						if currentItem != nil {
+							currentIndex = currentItem.Index()
+						}
+						if focusedIndex != currentIndex || version != t.version {
 							version = t.version
-							focused = currentFocus
+							focusedIndex = currentIndex
 							if t.isPreviewEnabled() {
 								_, list := t.buildPlusList(t.preview.command, false)
+								t.cancelPreview()
 								t.previewBox.Set(reqPreviewEnqueue, list)
 							}
 						}
@@ -1549,7 +1686,6 @@ func (t *Terminal) Loop() {
 						exit(func() int { return exitInterrupt })
 					}
 				}
-				t.placeCursor()
 				t.refresh()
 				t.mutex.Unlock()
 			})
@@ -1558,11 +1694,16 @@ func (t *Terminal) Loop() {
 
 	looping := true
 	for looping {
+		var newCommand *string
+		changed := false
+		queryChanged := false
+
 		event := t.tui.GetChar()
 
 		t.mutex.Lock()
 		previousInput := t.input
-		events := []util.EventType{reqPrompt}
+		previousCx := t.cx
+		events := []util.EventType{}
 		req := func(evts ...util.EventType) {
 			for _, event := range evts {
 				events = append(events, event)
@@ -1571,16 +1712,23 @@ func (t *Terminal) Loop() {
 				}
 			}
 		}
-		toggle := func() {
-			if t.cy < t.merger.Length() {
-				t.toggleItem(t.merger.Get(t.cy).item)
+		toggle := func() bool {
+			if t.cy < t.merger.Length() && t.toggleItem(t.merger.Get(t.cy).item) {
 				req(reqInfo)
+				return true
 			}
+			return false
 		}
 		scrollPreview := func(amount int) {
-			t.previewer.offset = util.Constrain(
+			if !t.previewer.more {
+				return
+			}
+			newOffset := util.Constrain(
 				t.previewer.offset+amount, 0, t.previewer.lines-1)
-			req(reqPreviewRefresh)
+			if t.previewer.offset != newOffset {
+				t.previewer.offset = newOffset
+				req(reqPreviewRefresh)
+			}
 		}
 		for key, ret := range t.expect {
 			if keyMatch(key, event) {
@@ -1618,10 +1766,11 @@ func (t *Terminal) Loop() {
 					if t.previewer.enabled {
 						valid, list := t.buildPlusList(t.preview.command, false)
 						if valid {
+							t.cancelPreview()
 							t.previewBox.Set(reqPreviewEnqueue, list)
 						}
 					}
-					req(reqList, reqInfo, reqHeader)
+					req(reqPrompt, reqList, reqInfo, reqHeader)
 				}
 			case actTogglePreviewWrap:
 				if t.hasPreviewWindow() {
@@ -1630,9 +1779,7 @@ func (t *Terminal) Loop() {
 				}
 			case actToggleSort:
 				t.sort = !t.sort
-				t.eventBox.Set(EvtSearchNew, t.sort)
-				t.mutex.Unlock()
-				return false
+				changed = true
 			case actPreviewUp:
 				if t.hasPreviewWindow() {
 					scrollPreview(-1)
@@ -1690,27 +1837,43 @@ func (t *Terminal) Loop() {
 					t.cx--
 				}
 			case actSelectAll:
-				if t.multi {
+				if t.multi > 0 {
 					for i := 0; i < t.merger.Length(); i++ {
-						t.selectItem(t.merger.Get(i).item)
+						if !t.selectItem(t.merger.Get(i).item) {
+							break
+						}
 					}
 					req(reqList, reqInfo)
 				}
 			case actDeselectAll:
-				if t.multi {
-					t.selected = make(map[int32]selectedItem)
-					t.version++
+				if t.multi > 0 {
+					for i := 0; i < t.merger.Length() && len(t.selected) > 0; i++ {
+						t.deselectItem(t.merger.Get(i).item)
+					}
 					req(reqList, reqInfo)
 				}
 			case actToggle:
-				if t.multi && t.merger.Length() > 0 {
-					toggle()
+				if t.multi > 0 && t.merger.Length() > 0 && toggle() {
 					req(reqList)
 				}
 			case actToggleAll:
-				if t.multi {
+				if t.multi > 0 {
+					prevIndexes := make(map[int]struct{})
+					for i := 0; i < t.merger.Length() && len(t.selected) > 0; i++ {
+						item := t.merger.Get(i).item
+						if _, found := t.selected[item.Index()]; found {
+							prevIndexes[i] = struct{}{}
+							t.deselectItem(item)
+						}
+					}
+
 					for i := 0; i < t.merger.Length(); i++ {
-						t.toggleItem(t.merger.Get(i).item)
+						if _, found := prevIndexes[i]; !found {
+							item := t.merger.Get(i).item
+							if !t.selectItem(item) {
+								break
+							}
+						}
 					}
 					req(reqList, reqInfo)
 				}
@@ -1725,14 +1888,12 @@ func (t *Terminal) Loop() {
 				}
 				return doAction(action{t: actToggleUp}, mapkey)
 			case actToggleDown:
-				if t.multi && t.merger.Length() > 0 {
-					toggle()
+				if t.multi > 0 && t.merger.Length() > 0 && toggle() {
 					t.vmove(-1, true)
 					req(reqList)
 				}
 			case actToggleUp:
-				if t.multi && t.merger.Length() > 0 {
-					toggle()
+				if t.multi > 0 && t.merger.Length() > 0 && toggle() {
 					t.vmove(1, true)
 					req(reqList)
 				}
@@ -1750,6 +1911,15 @@ func (t *Terminal) Loop() {
 				}
 			case actClearScreen:
 				req(reqRedraw)
+			case actClearQuery:
+				t.input = []rune{}
+				t.cx = 0
+			case actClearSelection:
+				if t.multi > 0 {
+					t.selected = make(map[int32]selectedItem)
+					t.version++
+					req(reqList, reqInfo)
+				}
 			case actTop:
 				t.vset(0)
 				req(reqList)
@@ -1836,7 +2006,7 @@ func (t *Terminal) Loop() {
 				if me.S != 0 {
 					// Scroll
 					if t.window.Enclose(my, mx) && t.merger.Length() > 0 {
-						if t.multi && me.Mod {
+						if t.multi > 0 && me.Mod {
 							toggle()
 						}
 						t.vmove(me.S, true)
@@ -1849,7 +2019,7 @@ func (t *Terminal) Loop() {
 					my -= t.window.Top()
 					mx = util.Constrain(mx-t.promptLen, 0, len(t.input))
 					min := 2 + len(t.header)
-					if t.inlineInfo {
+					if t.noInfoLine() {
 						min--
 					}
 					h := t.window.Height()
@@ -1876,7 +2046,7 @@ func (t *Terminal) Loop() {
 							t.cx = mx + t.xoffset
 						} else if my >= min {
 							// List
-							if t.vset(t.offset+my-min) && t.multi && me.Mod {
+							if t.vset(t.offset+my-min) && t.multi > 0 && me.Mod {
 								toggle()
 							}
 							req(reqList)
@@ -1887,10 +2057,25 @@ func (t *Terminal) Loop() {
 						}
 					}
 				}
+			case actReload:
+				t.failed = nil
+
+				valid, list := t.buildPlusList(a.a, false)
+				if !valid {
+					// We run the command even when there's no match
+					// 1. If the template doesn't have any slots
+					// 2. If the template has {q}
+					slot, _, query := hasPreviewFlags(a.a)
+					valid = !slot || query
+				}
+				if valid {
+					command := replacePlaceholder(a.a,
+						t.ansi, t.delimiter, t.printsep, false, string(t.input), list)
+					newCommand = &command
+				}
 			}
 			return true
 		}
-		changed := false
 		mapkey := event.Type
 		if t.jumping == jumpDisabled {
 			actions := t.keymap[mapkey]
@@ -1904,8 +2089,9 @@ func (t *Terminal) Loop() {
 				continue
 			}
 			t.truncateQuery()
-			changed = string(previousInput) != string(t.input)
-			if onChanges, prs := t.keymap[tui.Change]; changed && prs {
+			queryChanged = string(previousInput) != string(t.input)
+			changed = changed || queryChanged
+			if onChanges, prs := t.keymap[tui.Change]; queryChanged && prs {
 				if !doActions(onChanges, tui.Change) {
 					continue
 				}
@@ -1922,16 +2108,24 @@ func (t *Terminal) Loop() {
 			t.jumping = jumpDisabled
 			req(reqList)
 		}
-		t.mutex.Unlock() // Must be unlocked before touching reqBox
 
-		if changed {
+		if queryChanged {
 			if t.isPreviewEnabled() {
-				_, q := hasPreviewFlags(t.preview.command)
+				_, _, q := hasPreviewFlags(t.preview.command)
 				if q {
 					t.version++
 				}
 			}
-			t.eventBox.Set(EvtSearchNew, t.sort)
+		}
+
+		if queryChanged || t.cx != previousCx {
+			req(reqPrompt)
+		}
+
+		t.mutex.Unlock() // Must be unlocked before touching reqBox
+
+		if changed || newCommand != nil {
+			t.eventBox.Set(EvtSearchNew, searchRequest{sort: t.sort, command: newCommand})
 		}
 		for _, event := range events {
 			t.reqBox.Set(event, nil)
@@ -1981,7 +2175,7 @@ func (t *Terminal) vset(o int) bool {
 
 func (t *Terminal) maxItems() int {
 	max := t.window.Height() - 2 - len(t.header)
-	if t.inlineInfo {
+	if t.noInfoLine() {
 		max++
 	}
 	return util.Max(max, 0)
